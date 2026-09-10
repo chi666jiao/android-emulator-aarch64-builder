@@ -1,6 +1,9 @@
 # 交叉编译 Linux aarch64 Android Emulator
 # Actions → Build Emulator aarch64 → Run workflow
 # 产物：artifact「emulator-linux-aarch64」→ emulator-linux-aarch64.zip
+#
+# 注意：源码必须在 $GITHUB_WORKSPACE（maximize-build-space 腾的大盘），
+# 不要写到 runner.temp（易 No space / Cannot initialize work tree）
 
 name: Build Emulator aarch64
 
@@ -72,22 +75,47 @@ jobs:
           git config --global color.ui false
 
       - name: repo sync emu-master-dev
-        working-directory: ${{ runner.temp }}
+        working-directory: ${{ github.workspace }}
         run: |
           set -eux
+          df -h
           mkdir -p emu && cd emu
+          # 清理可能残留
+          find . -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
           repo init -u https://android.googlesource.com/platform/manifest \
             -b emu-master-dev --depth=1
-          repo sync -c -j8 --no-tags --fail-fast
-          echo "EMU_SRC=${{ runner.temp }}/emu" >> "$GITHUB_ENV"
+
+          set +e
+          rc=1
+          for i in 1 2 3 4 5; do
+            echo "=== repo sync try $i ==="
+            df -h
+            repo sync -c -j4 --no-tags --fail-fast
+            rc=$?
+            if [ "$rc" -eq 0 ]; then
+              echo "repo sync OK"
+              break
+            fi
+            echo "sync failed rc=$rc, try repair common prebuilt"
+            repo sync -c -j1 --no-tags --fail-fast \
+              platform/prebuilts/android-emulator-build/common || true
+            repo forall -c 'git reset --hard; git clean -fd' || true
+            sleep 15
+          done
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "final full sync attempt"
+            repo sync -c -j2 --no-tags --fail-fast
+          fi
+
+          echo "EMU_SRC=${{ github.workspace }}/emu" >> "$GITHUB_ENV"
           df -h
           du -sh . | tail -1
 
       - name: Drop unused trees to save disk
-        working-directory: ${{ runner.temp }}/emu
+        working-directory: ${{ github.workspace }}/emu
         run: |
           set -eux
-          # sync 完即可删，释放大量空间
           rm -rf .repo
           rm -rf \
             external/qemu/android/docs \
@@ -106,7 +134,7 @@ jobs:
             emu-aarch64-ccache-
 
       - name: Patch known build breaks
-        working-directory: ${{ runner.temp }}/emu
+        working-directory: ${{ github.workspace }}/emu
         run: |
           set -eux
           f1=external/google-breakpad/src/client/linux/handler/exception_handler.cc
@@ -119,7 +147,7 @@ jobs:
           fi
 
       - name: Build linux_aarch64
-        working-directory: ${{ runner.temp }}/emu/external/qemu
+        working-directory: ${{ github.workspace }}/emu/external/qemu
         run: |
           set -eux
           export PATH="$HOME/.local/bin:$PATH"
@@ -139,29 +167,27 @@ jobs:
           ls -lh objs/distribution/emulator | head
           test -f objs/distribution/emulator/source.properties
           cat objs/distribution/emulator/source.properties
-          # 确认 aarch64
           find objs/distribution/emulator/qemu -name 'qemu-system-aarch64*' -type f | head
           file objs/distribution/emulator/qemu/linux-aarch64/qemu-system-aarch64* | head || true
 
       - name: Strip ELF (optional)
-        working-directory: ${{ runner.temp }}/emu/external/qemu
+        working-directory: ${{ github.workspace }}/emu/external/qemu
         run: |
           set -eux
           find objs/distribution/emulator -type f -print0 \
             | xargs -0 -I{} sh -c 'file "$1" | grep -qi "ELF" && llvm-strip --strip-all "$1" || true' _ {}
 
       - name: Clean build trees before zip
-        working-directory: ${{ runner.temp }}/emu/external/qemu
+        working-directory: ${{ github.workspace }}/emu/external/qemu
         run: |
           set -eux
           find objs -mindepth 1 -maxdepth 1 ! -name distribution -exec rm -rf {} +
-          # 源码树已不需要，尽量腾空间给 zip
-          rm -rf "${{ runner.temp }}/emu/external/grpc" || true
+          rm -rf "${{ github.workspace }}/emu/external/grpc" || true
           rm -rf /home/runner/.cache/ccache || true
           df -h
 
       - name: Pack zip
-        working-directory: ${{ runner.temp }}/emu/external/qemu/objs/distribution
+        working-directory: ${{ github.workspace }}/emu/external/qemu/objs/distribution
         run: |
           set -eux
           zip -r "$GITHUB_WORKSPACE/emulator-linux-aarch64.zip" emulator
