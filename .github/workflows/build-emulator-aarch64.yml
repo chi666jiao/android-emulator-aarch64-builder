@@ -1,6 +1,6 @@
 # 交叉编译 Linux aarch64 Android Emulator
 # Actions → Build Emulator aarch64 → Run workflow
-# 产物：artifact「emulator-linux-aarch64」
+# 产物：artifact「emulator-linux-aarch64」→ emulator-linux-aarch64.zip
 
 name: Build Emulator aarch64
 
@@ -13,11 +13,38 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Free disk space
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@v10
+        with:
+          root-reserve-mb: 2048
+          swap-size-mb: 4096
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+
+      - name: Free disk space (extra)
         run: |
           set -eux
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/local/share/boost \
+            /usr/share/swift \
+            /usr/local/.ghcup \
+            /usr/share/miniconda \
+            /usr/local/share/powershell \
+            /usr/lib/jvm \
+            /usr/share/gradle \
+            /opt/hostedtoolcache/CodeQL \
+            /opt/hostedtoolcache/go \
+            /opt/hostedtoolcache/Python \
+            /opt/hostedtoolcache/node \
+            "${AGENT_TOOLSDIRECTORY:-}" || true
+          sudo apt-get clean || true
+          sudo docker system prune -af || true
           df -h
 
       - name: Install deps
@@ -27,16 +54,16 @@ jobs:
           sudo apt-get install -y \
             python3 python-is-python3 python3-pip \
             crossbuild-essential-arm64 mesa-common-dev \
-            ccache git llvm ninja-build cmake wget curl
-          # Ubuntu 22.04 默认源里不一定有 google repo 包，用官方安装脚本
+            ccache git llvm ninja-build cmake wget curl zip unzip
           curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo > /tmp/repo
           sudo install -m 0755 /tmp/repo /usr/local/bin/repo
           pip3 install --user absl-py urlfetch
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          ccache -o max_size=15G
+          ccache -o max_size=5G
           ccache -o hard_link=true
           repo --version
           python3 --version
+          df -h
 
       - name: Configure git
         run: |
@@ -51,12 +78,24 @@ jobs:
           mkdir -p emu && cd emu
           repo init -u https://android.googlesource.com/platform/manifest \
             -b emu-master-dev --depth=1
-          # 网络不稳可多跑几次；-j 别太大
           repo sync -c -j8 --no-tags --fail-fast
-          # 给后续 step 用
           echo "EMU_SRC=${{ runner.temp }}/emu" >> "$GITHUB_ENV"
           df -h
-          du -sh emu | tail -1
+          du -sh . | tail -1
+
+      - name: Drop unused trees to save disk
+        working-directory: ${{ runner.temp }}/emu
+        run: |
+          set -eux
+          # sync 完即可删，释放大量空间
+          rm -rf .repo
+          rm -rf \
+            external/qemu/android/docs \
+            external/qemu/tests \
+            prebuilts/android-emulator-build/archive \
+            || true
+          df -h
+          du -sh . 2>/dev/null | tail -1 || true
 
       - name: ccache
         uses: actions/cache@v4
@@ -70,7 +109,6 @@ jobs:
         working-directory: ${{ runner.temp }}/emu
         run: |
           set -eux
-          # breakpad / crashpad 在新编译器上偶发挂，有则改、无则跳过
           f1=external/google-breakpad/src/client/linux/handler/exception_handler.cc
           if [ -f "$f1" ]; then
             sed -i 's/kSigStackSize = std::max(/kSigStackSize = std::max<unsigned>(/g' "$f1" || true
@@ -85,6 +123,7 @@ jobs:
         run: |
           set -eux
           export PATH="$HOME/.local/bin:$PATH"
+          df -h
           ccache -z
           python3 android/build/python/cmake.py \
             --noqtwebengine \
@@ -96,13 +135,13 @@ jobs:
             --minbuild \
             --no-tests
           ccache -s
+          df -h
           ls -lh objs/distribution/emulator | head
-          # 确认是 aarch64
-          find objs/distribution/emulator -type f | head -20
-          file objs/distribution/emulator/qemu/linux-aarch64/qemu-system-aarch64 \
-            || file objs/distribution/emulator/qemu/linux-aarch64/* | head
           test -f objs/distribution/emulator/source.properties
           cat objs/distribution/emulator/source.properties
+          # 确认 aarch64
+          find objs/distribution/emulator/qemu -name 'qemu-system-aarch64*' -type f | head
+          file objs/distribution/emulator/qemu/linux-aarch64/qemu-system-aarch64* | head || true
 
       - name: Strip ELF (optional)
         working-directory: ${{ runner.temp }}/emu/external/qemu
@@ -111,17 +150,25 @@ jobs:
           find objs/distribution/emulator -type f -print0 \
             | xargs -0 -I{} sh -c 'file "$1" | grep -qi "ELF" && llvm-strip --strip-all "$1" || true' _ {}
 
+      - name: Clean build trees before zip
+        working-directory: ${{ runner.temp }}/emu/external/qemu
+        run: |
+          set -eux
+          find objs -mindepth 1 -maxdepth 1 ! -name distribution -exec rm -rf {} +
+          # 源码树已不需要，尽量腾空间给 zip
+          rm -rf "${{ runner.temp }}/emu/external/grpc" || true
+          rm -rf /home/runner/.cache/ccache || true
+          df -h
+
       - name: Pack zip
         working-directory: ${{ runner.temp }}/emu/external/qemu/objs/distribution
         run: |
           set -eux
-          # 打成带 emulator/ 根目录的 zip，方便解到 ANDROID_SDK_ROOT
           zip -r "$GITHUB_WORKSPACE/emulator-linux-aarch64.zip" emulator
           ls -lh "$GITHUB_WORKSPACE/emulator-linux-aarch64.zip"
-          # 必须够大，几百 MB 级；几 KB 就是失败
           python3 - <<'PY'
           import os
-          n=os.path.getsize(os.environ["GITHUB_WORKSPACE"]+"/emulator-linux-aarch64.zip")
+          n = os.path.getsize(os.environ["GITHUB_WORKSPACE"] + "/emulator-linux-aarch64.zip")
           print("zip_bytes", n)
           assert n > 50_000_000, "zip too small, build incomplete"
           PY
