@@ -19,13 +19,14 @@ jobs:
       - name: Maximize build space
         uses: easimon/maximize-build-space@v10
         with:
-          # 加大预留与 swap，降低编 Emulator 时 OOM / runner 失联
-          root-reserve-mb: 4096
-          swap-size-mb: 16384
+          # swap 过大占盘会导致 repo sync Errno 28；8G 折中防 OOM
+          root-reserve-mb: 2048
+          swap-size-mb: 8192
           remove-dotnet: "true"
           remove-android: "true"
           remove-haskell: "true"
           remove-codeql: "true"
+          remove-docker: "true"
 
       - name: Free disk space (extra)
         run: |
@@ -42,13 +43,19 @@ jobs:
             /usr/local/share/powershell \
             /usr/lib/jvm \
             /usr/share/gradle \
-            /opt/hostedtoolcache/CodeQL \
-            /opt/hostedtoolcache/go \
-            /opt/hostedtoolcache/Python \
-            /opt/hostedtoolcache/node \
+            /opt/hostedtoolcache \
+            /opt/microsoft \
+            /usr/local/lib/node_modules \
+            /var/lib/docker \
+            /var/cache/apt/archives \
             "${AGENT_TOOLSDIRECTORY:-}" || true
           sudo apt-get clean || true
           sudo docker system prune -af || true
+          # 把临时目录指到大盘，避免 /tmp 写满
+          mkdir -p "${{ github.workspace }}/.tmp"
+          echo "TMPDIR=${{ github.workspace }}/.tmp" >> "$GITHUB_ENV"
+          echo "TEMP=${{ github.workspace }}/.tmp" >> "$GITHUB_ENV"
+          echo "TMP=${{ github.workspace }}/.tmp" >> "$GITHUB_ENV"
           df -h
 
       - name: Install deps
@@ -80,33 +87,53 @@ jobs:
         run: |
           set -eux
           df -h
-          mkdir -p emu && cd emu
-          # 清理可能残留
+          free -h || true
+          # 关闭 repo trace，避免盘满时写 .repo/TRACE 再炸
+          export REPO_TRACE=0
+          export TMPDIR="${{ github.workspace }}/.tmp"
+          mkdir -p "$TMPDIR" emu
+          cd emu
+          # 清理可能残留（含半成品，避免重试叠盘）
           find . -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+          df -h
+
           repo init -u https://android.googlesource.com/platform/manifest \
             -b emu-master-dev --depth=1
 
           set +e
           rc=1
-          for i in 1 2 3 4 5; do
+          for i in 1 2 3; do
             echo "=== repo sync try $i ==="
             df -h
-            repo sync -c -j2 --no-tags --fail-fast
+            # 每次重试前清 trace / 临时垃圾
+            rm -f .repo/TRACE* .repo/trace* 2>/dev/null || true
+            rm -rf "$TMPDIR"/* 2>/dev/null || true
+            repo sync -c -j1 --no-tags --fail-fast
             rc=$?
             if [ "$rc" -eq 0 ]; then
               echo "repo sync OK"
               break
             fi
-            echo "sync failed rc=$rc, try repair common prebuilt"
+            echo "sync failed rc=$rc, disk:"
+            df -h
+            echo "try repair common prebuilt + clean"
             repo sync -c -j1 --no-tags --fail-fast \
               platform/prebuilts/android-emulator-build/common || true
             repo forall -c 'git reset --hard; git clean -fd' || true
-            sleep 15
+            # 盘满时再 retry 无意义，直接退出
+            AVAIL_KB=$(df -Pk . | awk 'NR==2{print $4}')
+            if [ "${AVAIL_KB:-0}" -lt 5000000 ]; then
+              echo "ERROR: free space <5GB, abort retries"
+              break
+            fi
+            sleep 10
           done
           set -e
           if [ "$rc" -ne 0 ]; then
-            echo "final full sync attempt"
-            repo sync -c -j1 --no-tags --fail-fast
+            echo "repo sync failed, disk state:"
+            df -h
+            du -sh .repo 2>/dev/null || true
+            exit "$rc"
           fi
 
           echo "EMU_SRC=${{ github.workspace }}/emu" >> "$GITHUB_ENV"
