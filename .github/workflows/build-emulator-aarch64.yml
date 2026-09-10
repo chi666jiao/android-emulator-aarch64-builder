@@ -1,0 +1,135 @@
+# 交叉编译 Linux aarch64 Android Emulator
+# Actions → Build Emulator aarch64 → Run workflow
+# 产物：artifact「emulator-linux-aarch64」
+
+name: Build Emulator aarch64
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Free disk space
+        run: |
+          set -eux
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h
+
+      - name: Install deps
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y \
+            python3 python-is-python3 python3-pip \
+            crossbuild-essential-arm64 mesa-common-dev \
+            ccache git llvm ninja-build cmake wget curl
+          # Ubuntu 22.04 默认源里不一定有 google repo 包，用官方安装脚本
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo > /tmp/repo
+          sudo install -m 0755 /tmp/repo /usr/local/bin/repo
+          pip3 install --user absl-py urlfetch
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          ccache -o max_size=15G
+          ccache -o hard_link=true
+          repo --version
+          python3 --version
+
+      - name: Configure git
+        run: |
+          git config --global user.email "ci@users.noreply.github.com"
+          git config --global user.name "emulator-builder"
+          git config --global color.ui false
+
+      - name: repo sync emu-master-dev
+        working-directory: ${{ runner.temp }}
+        run: |
+          set -eux
+          mkdir -p emu && cd emu
+          repo init -u https://android.googlesource.com/platform/manifest \
+            -b emu-master-dev --depth=1
+          # 网络不稳可多跑几次；-j 别太大
+          repo sync -c -j8 --no-tags --fail-fast
+          # 给后续 step 用
+          echo "EMU_SRC=${{ runner.temp }}/emu" >> "$GITHUB_ENV"
+          df -h
+          du -sh emu | tail -1
+
+      - name: ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: emu-aarch64-ccache-${{ github.run_id }}
+          restore-keys: |
+            emu-aarch64-ccache-
+
+      - name: Patch known build breaks
+        working-directory: ${{ runner.temp }}/emu
+        run: |
+          set -eux
+          # breakpad / crashpad 在新编译器上偶发挂，有则改、无则跳过
+          f1=external/google-breakpad/src/client/linux/handler/exception_handler.cc
+          if [ -f "$f1" ]; then
+            sed -i 's/kSigStackSize = std::max(/kSigStackSize = std::max<unsigned>(/g' "$f1" || true
+          fi
+          f2=external/qemu/android/third_party/crashpad/client/crashpad_client_linux_test.cc
+          if [ -f "$f2" ]; then
+            sed -i 's/constexpr size_t stack_size = MINSIGSTKSZ/static size_t stack_size = MINSIGSTKSZ/g' "$f2" || true
+          fi
+
+      - name: Build linux_aarch64
+        working-directory: ${{ runner.temp }}/emu/external/qemu
+        run: |
+          set -eux
+          export PATH="$HOME/.local/bin:$PATH"
+          ccache -z
+          python3 android/build/python/cmake.py \
+            --noqtwebengine \
+            --noshowprefixforinfo \
+            --target linux_aarch64 \
+            --config release \
+            --strip \
+            --ccache auto \
+            --minbuild \
+            --no-tests
+          ccache -s
+          ls -lh objs/distribution/emulator | head
+          # 确认是 aarch64
+          find objs/distribution/emulator -type f | head -20
+          file objs/distribution/emulator/qemu/linux-aarch64/qemu-system-aarch64 \
+            || file objs/distribution/emulator/qemu/linux-aarch64/* | head
+          test -f objs/distribution/emulator/source.properties
+          cat objs/distribution/emulator/source.properties
+
+      - name: Strip ELF (optional)
+        working-directory: ${{ runner.temp }}/emu/external/qemu
+        run: |
+          set -eux
+          find objs/distribution/emulator -type f -print0 \
+            | xargs -0 -I{} sh -c 'file "$1" | grep -qi "ELF" && llvm-strip --strip-all "$1" || true' _ {}
+
+      - name: Pack zip
+        working-directory: ${{ runner.temp }}/emu/external/qemu/objs/distribution
+        run: |
+          set -eux
+          # 打成带 emulator/ 根目录的 zip，方便解到 ANDROID_SDK_ROOT
+          zip -r "$GITHUB_WORKSPACE/emulator-linux-aarch64.zip" emulator
+          ls -lh "$GITHUB_WORKSPACE/emulator-linux-aarch64.zip"
+          # 必须够大，几百 MB 级；几 KB 就是失败
+          python3 - <<'PY'
+          import os
+          n=os.path.getsize(os.environ["GITHUB_WORKSPACE"]+"/emulator-linux-aarch64.zip")
+          print("zip_bytes", n)
+          assert n > 50_000_000, "zip too small, build incomplete"
+          PY
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: emulator-linux-aarch64
+          path: emulator-linux-aarch64.zip
+          retention-days: 14
+          if-no-files-found: error
