@@ -19,8 +19,9 @@ jobs:
       - name: Maximize build space
         uses: easimon/maximize-build-space@v10
         with:
-          root-reserve-mb: 2048
-          swap-size-mb: 4096
+          # 加大预留与 swap，降低编 Emulator 时 OOM / runner 失联
+          root-reserve-mb: 4096
+          swap-size-mb: 16384
           remove-dotnet: "true"
           remove-android: "true"
           remove-haskell: "true"
@@ -62,7 +63,7 @@ jobs:
           sudo install -m 0755 /tmp/repo /usr/local/bin/repo
           pip3 install --user absl-py urlfetch
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          ccache -o max_size=5G
+          ccache -o max_size=2G
           ccache -o hard_link=true
           repo --version
           python3 --version
@@ -90,7 +91,7 @@ jobs:
           for i in 1 2 3 4 5; do
             echo "=== repo sync try $i ==="
             df -h
-            repo sync -c -j4 --no-tags --fail-fast
+            repo sync -c -j2 --no-tags --fail-fast
             rc=$?
             if [ "$rc" -eq 0 ]; then
               echo "repo sync OK"
@@ -105,7 +106,7 @@ jobs:
           set -e
           if [ "$rc" -ne 0 ]; then
             echo "final full sync attempt"
-            repo sync -c -j2 --no-tags --fail-fast
+            repo sync -c -j1 --no-tags --fail-fast
           fi
 
           echo "EMU_SRC=${{ github.workspace }}/emu" >> "$GITHUB_ENV"
@@ -162,7 +163,11 @@ jobs:
         run: |
           set -eux
           export PATH="$HOME/.local/bin:$PATH"
+          # 限制并行，避免免费 runner OOM → lost communication
+          export CMAKE_BUILD_PARALLEL_LEVEL=2
+          export NINJA_STATUS="[%f/%t %es] "
           df -h
+          free -h || true
           ccache -z
           python3 android/build/python/cmake.py \
             --noqtwebengine \
@@ -175,6 +180,7 @@ jobs:
             --no-tests
           ccache -s
           df -h
+          free -h || true
           ls -lh objs/distribution/emulator | head
           test -f objs/distribution/emulator/source.properties
           cat objs/distribution/emulator/source.properties
