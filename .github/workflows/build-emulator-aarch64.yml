@@ -2,8 +2,8 @@
 # Actions → Build Emulator aarch64 → Run workflow
 # 产物：artifact「emulator-linux-aarch64」→ emulator-linux-aarch64.zip
 #
-# 注意：源码必须在 $GITHUB_WORKSPACE（maximize-build-space 腾的大盘），
-# 不要写到 runner.temp（易 No space / Cannot initialize work tree）
+# 关键点：maximize 会把 / 压到 root-reserve；apt/pip/git 默认写 / 与 /tmp。
+# 必须：root-reserve 足够大 + TMPDIR/XDG_CACHE 指到大盘工作区。
 
 name: Build Emulator aarch64
 
@@ -19,8 +19,9 @@ jobs:
       - name: Maximize build space
         uses: easimon/maximize-build-space@v10
         with:
-          # 大盘给编译；swap 适中（过大反而占盘）
-          root-reserve-mb: 2048
+          # / 上要留给 apt、pip、/tmp；太小会出现「工作区还有 99G 但 sync 秒挂」
+          root-reserve-mb: 20480
+          temp-reserve-mb: 1024
           swap-size-mb: 4096
           remove-dotnet: "true"
           remove-android: "true"
@@ -28,7 +29,7 @@ jobs:
           remove-codeql: "true"
           remove-docker-images: "true"
 
-      - name: Free disk space (extra)
+      - name: Free disk + redirect temp to big volume
         run: |
           set -eux
           df -h
@@ -51,23 +52,33 @@ jobs:
             "${AGENT_TOOLSDIRECTORY:-}" || true
           sudo apt-get clean || true
           sudo docker system prune -af || true
-          # 把临时目录指到大盘，避免 /tmp 写满
-          mkdir -p "${{ github.workspace }}/.tmp"
-          echo "TMPDIR=${{ github.workspace }}/.tmp" >> "$GITHUB_ENV"
-          echo "TEMP=${{ github.workspace }}/.tmp" >> "$GITHUB_ENV"
-          echo "TMP=${{ github.workspace }}/.tmp" >> "$GITHUB_ENV"
-          df -h
+
+          WS="${{ github.workspace }}"
+          mkdir -p "$WS/.tmp" "$WS/.cache" "$WS/.ccache"
+          # 后续步骤全部走大盘，避免写爆只剩十几 G 的 /
+          {
+            echo "TMPDIR=$WS/.tmp"
+            echo "TEMP=$WS/.tmp"
+            echo "TMP=$WS/.tmp"
+            echo "XDG_CACHE_HOME=$WS/.cache"
+            echo "CCACHE_DIR=$WS/.ccache"
+          } >> "$GITHUB_ENV"
+
+          echo "=== mounts ==="
+          df -h / /tmp /home /mnt "$WS" || true
 
       - name: Install deps
         run: |
           set -eux
+          df -h / /tmp "${{ github.workspace }}" || true
           sudo apt-get update
           sudo apt-get install -y \
             python3 python-is-python3 python3-pip \
             crossbuild-essential-arm64 mesa-common-dev \
             ccache git llvm ninja-build cmake wget curl zip unzip
           mkdir -p "${{ github.workspace }}/.tmp"
-          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo > "${{ github.workspace }}/.tmp/repo"
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo \
+            > "${{ github.workspace }}/.tmp/repo"
           sudo install -m 0755 "${{ github.workspace }}/.tmp/repo" /usr/local/bin/repo
           pip3 install --user absl-py urlfetch
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
@@ -75,30 +86,40 @@ jobs:
           ccache -o hard_link=true
           repo --version
           python3 --version
-          df -h
+          df -h / /tmp "${{ github.workspace }}" || true
 
       - name: Configure git
         run: |
           git config --global user.email "ci@users.noreply.github.com"
           git config --global user.name "emulator-builder"
           git config --global color.ui false
+          # 降低偶发 HTTP/2 断流
+          git config --global http.version HTTP/1.1
+          git config --global http.postBuffer 524288000
 
       - name: repo sync emu-master-dev
         working-directory: ${{ github.workspace }}
         run: |
           set -eux
-          df -h
-          free -h || true
-          # 工作区必须在大盘（buildvg ~95G）；否则 sync 会写爆小盘
-          df -h .
+          WS="${{ github.workspace }}"
           export REPO_TRACE=0
-          export TMPDIR="${{ github.workspace }}/.tmp"
+          export TMPDIR="$WS/.tmp"
           export TMP="$TMPDIR"
           export TEMP="$TMPDIR"
-          mkdir -p "$TMPDIR" emu
+          export XDG_CACHE_HOME="$WS/.cache"
+          mkdir -p "$TMPDIR" "$XDG_CACHE_HOME" emu
+
+          echo "=== disk before sync ==="
+          df -h / /tmp /home "$WS" || true
+          free -h || true
+
+          # 探测 googlesource（失败也能从日志看清是网络问题）
+          curl -fsSIL --max-time 30 \
+            https://android.googlesource.com/platform/manifest \
+            | head -n 20 || echo "WARN: manifest HEAD probe failed"
+
           cd emu
           find . -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
-          df -h .
 
           repo init -u https://android.googlesource.com/platform/manifest \
             -b emu-master-dev --depth=1
@@ -107,41 +128,38 @@ jobs:
           rc=1
           for i in 1 2 3; do
             echo "=== repo sync try $i ==="
-            df -h .
-            rm -f .repo/TRACE* .repo/TRACE 2>/dev/null || true
-            find "$TMPDIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
-            SYNC_LOG="$TMPDIR/repo-sync-$i.log"
-            repo sync -c -j1 --no-tags --fail-fast >"$SYNC_LOG" 2>&1
-            rc=$?
-            tail -n 80 "$SYNC_LOG" || true
+            df -h / /tmp "$WS" || true
+            rm -f .repo/TRACE .repo/TRACE* 2>/dev/null || true
+            SYNC_LOG="$WS/.tmp/repo-sync-$i.log"
+            # 对齐官方/LSPosed：-c + 适度并行；tee 保证 Actions 日志可见
+            # 不要只重定向到文件（上次失败日志只有 980B，底栏又没 cat）
+            repo sync -c -j4 --no-tags 2>&1 | tee "$SYNC_LOG"
+            rc=${PIPESTATUS[0]}
             if [ "$rc" -eq 0 ]; then
               echo "repo sync OK"
               break
             fi
             echo "sync failed rc=$rc"
-            df -h .
-            grep -E 'error:|Error|Errno|fatal:|No space|Permission denied|Unable to' "$SYNC_LOG" | tail -n 40 || true
-            repo sync -c -j1 --no-tags --fail-fast \
-              platform/prebuilts/android-emulator-build/common || true
-            repo forall -c 'git reset --hard; git clean -fd' || true
-            AVAIL_KB=$(df -Pk . | awk 'NR==2{print $4}')
-            if [ "${AVAIL_KB:-0}" -lt 5000000 ]; then
-              echo "ERROR: free space <5GB on workspace, abort retries"
-              break
-            fi
-            sleep 10
+            echo "===== FULL SYNC LOG BEGIN ====="
+            cat "$SYNC_LOG" || true
+            echo "===== FULL SYNC LOG END ====="
+            echo "=== disk after fail ==="
+            df -h / /tmp /home "$WS" || true
+            du -sh .repo 2>/dev/null || true
+            sleep 15
           done
           set -e
+
           if [ "$rc" -ne 0 ]; then
-            echo "repo sync failed; workspace disk:"
-            df -h .
-            du -sh .repo 2>/dev/null || true
-            ls -la "$TMPDIR"/repo-sync-*.log 2>/dev/null || true
+            echo "repo sync ultimately failed"
+            echo "===== LAST LOG ====="
+            cat "$WS/.tmp"/repo-sync-*.log || true
+            df -h / /tmp /home "$WS" || true
             exit "$rc"
           fi
 
-          echo "EMU_SRC=${{ github.workspace }}/emu" >> "$GITHUB_ENV"
-          df -h .
+          echo "EMU_SRC=$WS/emu" >> "$GITHUB_ENV"
+          df -h / "$WS"
           du -sh . | tail -1
 
       - name: Drop unused trees to save disk
@@ -160,7 +178,7 @@ jobs:
       - name: ccache
         uses: actions/cache@v4
         with:
-          path: ~/.cache/ccache
+          path: ${{ github.workspace }}/.ccache
           key: emu-aarch64-ccache-${{ github.run_id }}
           restore-keys: |
             emu-aarch64-ccache-
@@ -194,7 +212,6 @@ jobs:
         run: |
           set -eux
           export PATH="$HOME/.local/bin:$PATH"
-          # 限制并行，避免免费 runner OOM → lost communication
           export CMAKE_BUILD_PARALLEL_LEVEL=2
           export NINJA_STATUS="[%f/%t %es] "
           df -h
@@ -231,7 +248,7 @@ jobs:
           set -eux
           find objs -mindepth 1 -maxdepth 1 ! -name distribution -exec rm -rf {} +
           rm -rf "${{ github.workspace }}/emu/external/grpc" || true
-          rm -rf /home/runner/.cache/ccache || true
+          rm -rf "${{ github.workspace }}/.ccache" || true
           df -h
 
       - name: Pack zip
