@@ -19,14 +19,14 @@ jobs:
       - name: Maximize build space
         uses: easimon/maximize-build-space@v10
         with:
-          # swap 过大占盘会导致 repo sync Errno 28；8G 折中防 OOM
+          # 大盘给编译；swap 适中（过大反而占盘）
           root-reserve-mb: 2048
-          swap-size-mb: 8192
+          swap-size-mb: 4096
           remove-dotnet: "true"
           remove-android: "true"
           remove-haskell: "true"
           remove-codeql: "true"
-          remove-docker: "true"
+          remove-docker-images: "true"
 
       - name: Free disk space (extra)
         run: |
@@ -66,8 +66,9 @@ jobs:
             python3 python-is-python3 python3-pip \
             crossbuild-essential-arm64 mesa-common-dev \
             ccache git llvm ninja-build cmake wget curl zip unzip
-          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo > /tmp/repo
-          sudo install -m 0755 /tmp/repo /usr/local/bin/repo
+          mkdir -p "${{ github.workspace }}/.tmp"
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo > "${{ github.workspace }}/.tmp/repo"
+          sudo install -m 0755 "${{ github.workspace }}/.tmp/repo" /usr/local/bin/repo
           pip3 install --user absl-py urlfetch
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           ccache -o max_size=2G
@@ -88,14 +89,16 @@ jobs:
           set -eux
           df -h
           free -h || true
-          # 关闭 repo trace，避免盘满时写 .repo/TRACE 再炸
+          # 工作区必须在大盘（buildvg ~95G）；否则 sync 会写爆小盘
+          df -h .
           export REPO_TRACE=0
           export TMPDIR="${{ github.workspace }}/.tmp"
+          export TMP="$TMPDIR"
+          export TEMP="$TMPDIR"
           mkdir -p "$TMPDIR" emu
           cd emu
-          # 清理可能残留（含半成品，避免重试叠盘）
           find . -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
-          df -h
+          df -h .
 
           repo init -u https://android.googlesource.com/platform/manifest \
             -b emu-master-dev --depth=1
@@ -104,40 +107,41 @@ jobs:
           rc=1
           for i in 1 2 3; do
             echo "=== repo sync try $i ==="
-            df -h
-            # 每次重试前清 trace / 临时垃圾
-            rm -f .repo/TRACE* .repo/trace* 2>/dev/null || true
-            rm -rf "$TMPDIR"/* 2>/dev/null || true
-            repo sync -c -j1 --no-tags --fail-fast
+            df -h .
+            rm -f .repo/TRACE* .repo/TRACE 2>/dev/null || true
+            find "$TMPDIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+            SYNC_LOG="$TMPDIR/repo-sync-$i.log"
+            repo sync -c -j1 --no-tags --fail-fast >"$SYNC_LOG" 2>&1
             rc=$?
+            tail -n 80 "$SYNC_LOG" || true
             if [ "$rc" -eq 0 ]; then
               echo "repo sync OK"
               break
             fi
-            echo "sync failed rc=$rc, disk:"
-            df -h
-            echo "try repair common prebuilt + clean"
+            echo "sync failed rc=$rc"
+            df -h .
+            grep -E 'error:|Error|Errno|fatal:|No space|Permission denied|Unable to' "$SYNC_LOG" | tail -n 40 || true
             repo sync -c -j1 --no-tags --fail-fast \
               platform/prebuilts/android-emulator-build/common || true
             repo forall -c 'git reset --hard; git clean -fd' || true
-            # 盘满时再 retry 无意义，直接退出
             AVAIL_KB=$(df -Pk . | awk 'NR==2{print $4}')
             if [ "${AVAIL_KB:-0}" -lt 5000000 ]; then
-              echo "ERROR: free space <5GB, abort retries"
+              echo "ERROR: free space <5GB on workspace, abort retries"
               break
             fi
             sleep 10
           done
           set -e
           if [ "$rc" -ne 0 ]; then
-            echo "repo sync failed, disk state:"
-            df -h
+            echo "repo sync failed; workspace disk:"
+            df -h .
             du -sh .repo 2>/dev/null || true
+            ls -la "$TMPDIR"/repo-sync-*.log 2>/dev/null || true
             exit "$rc"
           fi
 
           echo "EMU_SRC=${{ github.workspace }}/emu" >> "$GITHUB_ENV"
-          df -h
+          df -h .
           du -sh . | tail -1
 
       - name: Drop unused trees to save disk
