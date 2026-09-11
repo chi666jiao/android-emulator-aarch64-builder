@@ -2,8 +2,10 @@
 # Actions → Build Emulator aarch64 → Run workflow
 # 产物：artifact「emulator-linux-aarch64」→ emulator-linux-aarch64.zip
 #
-# 关键点：maximize 会把 / 压到 root-reserve；apt/pip/git 默认写 / 与 /tmp。
-# 必须：root-reserve 足够大 + TMPDIR/XDG_CACHE 指到大盘工作区。
+# 已修问题：
+# 1) 根盘预留太小 → apt/pip/tmp 写爆（工作区仍空）
+# 2) TMPDIR 落在超长 GITHUB_WORKSPACE → repo AF_UNIX path too long
+#    解法：大盘 bind 到短路径 /e，全程 TMPDIR=/e/t、源码在 /e/emu
 
 name: Build Emulator aarch64
 
@@ -19,7 +21,6 @@ jobs:
       - name: Maximize build space
         uses: easimon/maximize-build-space@v10
         with:
-          # / 上要留给 apt、pip、/tmp；太小会出现「工作区还有 99G 但 sync 秒挂」
           root-reserve-mb: 20480
           temp-reserve-mb: 1024
           swap-size-mb: 4096
@@ -29,7 +30,7 @@ jobs:
           remove-codeql: "true"
           remove-docker-images: "true"
 
-      - name: Free disk + redirect temp to big volume
+      - name: Free disk + bind workspace to /e
         run: |
           set -eux
           df -h
@@ -54,71 +55,77 @@ jobs:
           sudo docker system prune -af || true
 
           WS="${{ github.workspace }}"
-          mkdir -p "$WS/.tmp" "$WS/.cache" "$WS/.ccache"
-          # 后续步骤全部走大盘，避免写爆只剩十几 G 的 /
+          sudo mkdir -p /e
+          if ! findmnt -n /e >/dev/null 2>&1; then
+            sudo mount --bind "$WS" /e
+          fi
+          sudo chown -R "$(id -u):$(id -g)" /e
+          mkdir -p /e/t /e/c /e/cc /e/emu
+
           {
-            echo "TMPDIR=$WS/.tmp"
-            echo "TEMP=$WS/.tmp"
-            echo "TMP=$WS/.tmp"
-            echo "XDG_CACHE_HOME=$WS/.cache"
-            echo "CCACHE_DIR=$WS/.ccache"
+            echo "EMU_ROOT=/e"
+            echo "EMU_SRC=/e/emu"
+            echo "TMPDIR=/e/t"
+            echo "TEMP=/e/t"
+            echo "TMP=/e/t"
+            echo "XDG_CACHE_HOME=/e/c"
+            echo "CCACHE_DIR=/e/cc"
           } >> "$GITHUB_ENV"
 
-          echo "=== mounts ==="
-          df -h / /tmp /home /mnt "$WS" || true
+          df -h / /tmp /home /mnt "$WS" /e || true
+          python3 -c "import os; print('path_lens', len('/e/t'), len(r'''$WS'''.strip() or 'x'))"
 
       - name: Install deps
         run: |
           set -eux
-          df -h / /tmp "${{ github.workspace }}" || true
+          df -h / /tmp /e || true
           sudo apt-get update
           sudo apt-get install -y \
             python3 python-is-python3 python3-pip \
             crossbuild-essential-arm64 mesa-common-dev \
             ccache git llvm ninja-build cmake wget curl zip unzip
-          mkdir -p "${{ github.workspace }}/.tmp"
-          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo \
-            > "${{ github.workspace }}/.tmp/repo"
-          sudo install -m 0755 "${{ github.workspace }}/.tmp/repo" /usr/local/bin/repo
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo > /e/t/repo
+          sudo install -m 0755 /e/t/repo /usr/local/bin/repo
           pip3 install --user absl-py urlfetch
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           ccache -o max_size=2G
           ccache -o hard_link=true
           repo --version
           python3 --version
-          df -h / /tmp "${{ github.workspace }}" || true
+          df -h / /tmp /e || true
 
       - name: Configure git
         run: |
           git config --global user.email "ci@users.noreply.github.com"
           git config --global user.name "emulator-builder"
           git config --global color.ui false
-          # 降低偶发 HTTP/2 断流
           git config --global http.version HTTP/1.1
           git config --global http.postBuffer 524288000
 
       - name: repo sync emu-master-dev
-        working-directory: ${{ github.workspace }}
         run: |
           set -eux
-          WS="${{ github.workspace }}"
           export REPO_TRACE=0
-          export TMPDIR="$WS/.tmp"
-          export TMP="$TMPDIR"
-          export TEMP="$TMPDIR"
-          export XDG_CACHE_HOME="$WS/.cache"
-          mkdir -p "$TMPDIR" "$XDG_CACHE_HOME" emu
+          export TMPDIR=/e/t TEMP=/e/t TMP=/e/t
+          export XDG_CACHE_HOME=/e/c
+          mkdir -p /e/t /e/c /e/emu
 
-          echo "=== disk before sync ==="
-          df -h / /tmp /home "$WS" || true
+          echo "=== disk / tempfile check ==="
+          df -h / /tmp /home /e || true
           free -h || true
+          python3 - <<'PY'
+          import os, tempfile
+          td = tempfile.gettempdir()
+          print("TMPDIR", os.environ.get("TMPDIR"))
+          print("gettempdir", td, "len", len(td))
+          assert len(td) < 80, "temp path still too long for AF_UNIX"
+          PY
 
-          # 探测 googlesource（失败也能从日志看清是网络问题）
           curl -fsSIL --max-time 30 \
             https://android.googlesource.com/platform/manifest \
             | head -n 20 || echo "WARN: manifest HEAD probe failed"
 
-          cd emu
+          cd /e/emu
           find . -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
 
           repo init -u https://android.googlesource.com/platform/manifest \
@@ -128,11 +135,9 @@ jobs:
           rc=1
           for i in 1 2 3; do
             echo "=== repo sync try $i ==="
-            df -h / /tmp "$WS" || true
+            df -h / /tmp /e || true
             rm -f .repo/TRACE .repo/TRACE* 2>/dev/null || true
-            SYNC_LOG="$WS/.tmp/repo-sync-$i.log"
-            # 对齐官方/LSPosed：-c + 适度并行；tee 保证 Actions 日志可见
-            # 不要只重定向到文件（上次失败日志只有 980B，底栏又没 cat）
+            SYNC_LOG="/e/t/repo-sync-$i.log"
             repo sync -c -j4 --no-tags 2>&1 | tee "$SYNC_LOG"
             rc=${PIPESTATUS[0]}
             if [ "$rc" -eq 0 ]; then
@@ -143,27 +148,28 @@ jobs:
             echo "===== FULL SYNC LOG BEGIN ====="
             cat "$SYNC_LOG" || true
             echo "===== FULL SYNC LOG END ====="
-            echo "=== disk after fail ==="
-            df -h / /tmp /home "$WS" || true
+            df -h / /tmp /home /e || true
             du -sh .repo 2>/dev/null || true
+            # AF_UNIX 类错误重试无意义
+            if grep -q 'AF_UNIX path too long' "$SYNC_LOG" 2>/dev/null; then
+              echo "FATAL: AF_UNIX path too long — TMPDIR must stay short (/e/t)"
+              break
+            fi
             sleep 15
           done
           set -e
 
           if [ "$rc" -ne 0 ]; then
-            echo "repo sync ultimately failed"
-            echo "===== LAST LOG ====="
-            cat "$WS/.tmp"/repo-sync-*.log || true
-            df -h / /tmp /home "$WS" || true
+            cat /e/t/repo-sync-*.log || true
+            df -h / /tmp /home /e || true
             exit "$rc"
           fi
 
-          echo "EMU_SRC=$WS/emu" >> "$GITHUB_ENV"
-          df -h / "$WS"
+          df -h / /e
           du -sh . | tail -1
 
       - name: Drop unused trees to save disk
-        working-directory: ${{ github.workspace }}/emu
+        working-directory: /e/emu
         run: |
           set -eux
           rm -rf .repo
@@ -172,19 +178,19 @@ jobs:
             external/qemu/tests \
             prebuilts/android-emulator-build/archive \
             || true
-          df -h
+          df -h /e
           du -sh . 2>/dev/null | tail -1 || true
 
       - name: ccache
         uses: actions/cache@v4
         with:
-          path: ${{ github.workspace }}/.ccache
+          path: /e/cc
           key: emu-aarch64-ccache-${{ github.run_id }}
           restore-keys: |
             emu-aarch64-ccache-
 
       - name: Patch known build breaks
-        working-directory: ${{ github.workspace }}/emu
+        working-directory: /e/emu
         run: |
           set -eux
           f1=external/google-breakpad/src/client/linux/handler/exception_handler.cc
@@ -197,7 +203,7 @@ jobs:
           fi
 
       - name: Patch Snapshotter.cpp missing thread header
-        working-directory: ${{ github.workspace }}/emu
+        working-directory: /e/emu
         run: |
           set -euo pipefail
           f="external/qemu/android/android-emu/android/snapshot/Snapshotter.cpp"
@@ -208,13 +214,15 @@ jobs:
           grep -n 'thread\|chrono\|sleep_for' "$f" | head -20
 
       - name: Build linux_aarch64
-        working-directory: ${{ github.workspace }}/emu/external/qemu
+        working-directory: /e/emu/external/qemu
         run: |
           set -eux
           export PATH="$HOME/.local/bin:$PATH"
+          export TMPDIR=/e/t TEMP=/e/t TMP=/e/t
+          export CCACHE_DIR=/e/cc
           export CMAKE_BUILD_PARALLEL_LEVEL=2
           export NINJA_STATUS="[%f/%t %es] "
-          df -h
+          df -h / /e
           free -h || true
           ccache -z
           python3 android/build/python/cmake.py \
@@ -227,7 +235,7 @@ jobs:
             --minbuild \
             --no-tests
           ccache -s
-          df -h
+          df -h / /e
           free -h || true
           ls -lh objs/distribution/emulator | head
           test -f objs/distribution/emulator/source.properties
@@ -236,30 +244,35 @@ jobs:
           file objs/distribution/emulator/qemu/linux-aarch64/qemu-system-aarch64* | head || true
 
       - name: Strip ELF (optional)
-        working-directory: ${{ github.workspace }}/emu/external/qemu
+        working-directory: /e/emu/external/qemu
         run: |
           set -eux
           find objs/distribution/emulator -type f -print0 \
             | xargs -0 -I{} sh -c 'file "$1" | grep -qi "ELF" && llvm-strip --strip-all "$1" || true' _ {}
 
       - name: Clean build trees before zip
-        working-directory: ${{ github.workspace }}/emu/external/qemu
+        working-directory: /e/emu/external/qemu
         run: |
           set -eux
           find objs -mindepth 1 -maxdepth 1 ! -name distribution -exec rm -rf {} +
-          rm -rf "${{ github.workspace }}/emu/external/grpc" || true
-          rm -rf "${{ github.workspace }}/.ccache" || true
-          df -h
+          rm -rf /e/emu/external/grpc || true
+          rm -rf /e/cc || true
+          df -h /e
 
       - name: Pack zip
-        working-directory: ${{ github.workspace }}/emu/external/qemu/objs/distribution
+        working-directory: /e/emu/external/qemu/objs/distribution
         run: |
           set -eux
-          zip -r "$GITHUB_WORKSPACE/emulator-linux-aarch64.zip" emulator
-          ls -lh "$GITHUB_WORKSPACE/emulator-linux-aarch64.zip"
+          zip -r /e/emulator-linux-aarch64.zip emulator
+          # artifact 路径相对仓库根（与 /e 同一块盘）
+          ln -sfn /e/emulator-linux-aarch64.zip \
+            "${{ github.workspace }}/emulator-linux-aarch64.zip" || \
+            cp -f /e/emulator-linux-aarch64.zip \
+              "${{ github.workspace }}/emulator-linux-aarch64.zip"
+          ls -lh /e/emulator-linux-aarch64.zip
           python3 - <<'PY'
           import os
-          n = os.path.getsize(os.environ["GITHUB_WORKSPACE"] + "/emulator-linux-aarch64.zip")
+          n = os.path.getsize("/e/emulator-linux-aarch64.zip")
           print("zip_bytes", n)
           assert n > 50_000_000, "zip too small, build incomplete"
           PY
